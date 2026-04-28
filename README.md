@@ -1,20 +1,16 @@
 # Simple Stack Exchange Archiver
 
-A single shell script that archives any Stack Exchange user profile into a fully self-contained static website. All pages, questions, answers, and navigation work offline with no external dependencies.
+Archives any Stack Exchange user profile into a self-contained static website. One command, one directory, everything works offline.
 
 ## What it does
 
-1. Downloads the 5 profile tab pages (top, accounts, reputation, activity, subscriptions)
-2. Detects and captures all pagination (questions, answers, activity)
-3. Downloads every linked question page across all SE sites
-4. Generates and runs a stitch script that:
-   - Rewrites tab navigation to local files
-   - Inlines paginated content with client-side JS switchers
-   - Rewrites all question/answer links to local pages
-   - Kills remaining external links (converts to non-clickable spans)
+1. Downloads all 5 profile tab pages (top, accounts, reputation, activity, subscriptions)
+2. Detects and captures paginated content (questions, answers, activity)
+3. Downloads every linked question page across all SE network sites
+4. Runs a generated stitch script that rewrites navigation to local files, inlines pagination with JS switchers, localizes question/answer links, and removes dead external links
 5. Cleans up temp files
 
-The result is a directory you can serve with any static file server or browse directly from the filesystem.
+The output is a directory you can serve with any static file server or open directly in a browser.
 
 ## Requirements
 
@@ -30,7 +26,7 @@ git clone https://github.com/krisyotam/sse-archiver.git
 cd sse-archiver
 chmod +x se-archive
 
-# symlink into PATH (optional)
+# optionally symlink into PATH
 ln -s "$PWD/se-archive" ~/.local/bin/se-archive
 ```
 
@@ -40,7 +36,7 @@ ln -s "$PWD/se-archive" ~/.local/bin/se-archive
 se-archive <stackexchange_user_url>
 ```
 
-The user URL is the network profile page on stackexchange.com:
+The URL should be the network profile page on stackexchange.com:
 
 ```sh
 # archive a math.SE user
@@ -54,16 +50,16 @@ cd ~/dev/cleo
 python3 -m http.server 8000
 ```
 
-The archive is saved to `~/dev/<username>/`.
+Archives are saved to `~/dev/<username>/`.
 
 ## Supported sites
 
-Any site in the Stack Exchange network:
+Works with any site in the Stack Exchange network:
 
 - Stack Overflow
 - Mathematics, MathOverflow
 - Super User, Server Fault, Ask Ubuntu
-- All other `*.stackexchange.com` sites (Physics, TeX, CS Theory, etc.)
+- All `*.stackexchange.com` sites (Physics, TeX, CS Theory, etc.)
 
 Question pages are prefixed by site: `math-562694.html`, `so-16452383.html`, `mo-130500.html`, `physics-12345.html`, etc.
 
@@ -71,12 +67,12 @@ Question pages are prefixed by site: `math-562694.html`, `so-16452383.html`, `mo
 
 ```
 <username>/
-  index.html          # top questions + top answers (with JS pagination)
+  index.html          # top questions + top answers with JS pagination
   accounts.html       # network accounts
   reputation.html     # reputation history
-  activity.html       # recent activity (with JS pagination)
+  activity.html       # recent activity with JS pagination
   subscriptions.html  # filter subscriptions
-  stitch.py           # generated stitcher (can be re-run)
+  stitch.py           # generated stitcher, can be re-run
   questions/
     math-562694.html   # individual question pages
     so-16452383.html
@@ -97,15 +93,15 @@ The script runs in 6 phases:
 | 5 | Extract all question URLs from every page, download each one |
 | 6 | Generate `stitch.py`, run it to rewrite links and inline pagination |
 
-The stitch script processes each profile page in order: rewrite tabs, inline pagination, rewrite question links, kill external links. This ordering ensures inlined pagination content gets its links rewritten before external link removal.
+The stitch script processes each profile page in order: rewrite tabs, inline pagination, rewrite question links, kill external links. This ordering matters because inlined pagination content needs its links rewritten before external link removal runs.
 
 ## Limitations
 
-- Some question pages may be blocked by Cloudflare or rate limiting. The script warns when a downloaded page is suspiciously small (<5KB). Re-running the script skips already-downloaded pages.
-- The "Hot Network Questions" sidebar on question pages contains links to unrelated questions that are not downloaded.
-- Images and CSS are loaded from SE CDN servers; the archive is not fully offline for styling/images.
-- JavaScript functionality beyond pagination (voting, commenting, etc.) is non-functional by design.
+- Cloudflare or rate limiting may block some question page downloads. The script warns when a page is suspiciously small (<5KB). Re-running skips pages already downloaded.
+- The "Hot Network Questions" sidebar links to unrelated questions that aren't downloaded.
+- CSS and images still load from SE CDN servers, so styling requires an internet connection.
+- Only pagination works client-side. Voting, commenting, and other interactive features are dead by design.
 
 ## License
 
-Public domain. Do whatever you want with it.
+Public domain.
