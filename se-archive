@@ -1,0 +1,483 @@
+#!/bin/sh
+# se-archive — archive a StackExchange user profile into a self-contained static site
+# usage: se-archive <se_user_url>
+# example: se-archive https://stackexchange.com/users/3364210/cleo
+
+set -e
+
+UA="Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
+
+# --- parse input ---
+url="$1"
+[ -z "$url" ] && { echo "usage: se-archive <stackexchange_user_url>"; exit 1; }
+
+# extract user id and slug from url
+se_uid=$(echo "$url" | grep -oP '/users/\K\d+')
+se_slug=$(echo "$url" | grep -oP '/users/\d+/\K[^/?]+')
+[ -z "$se_uid" ] && { echo "error: cannot parse user id from $url"; exit 1; }
+[ -z "$se_slug" ] && { echo "error: cannot parse username from $url"; exit 1; }
+
+dir="$HOME/dev/$se_slug"
+echo "=== Archiving $se_slug (SE ID: $se_uid) ==="
+echo "    Target: $dir"
+
+mkdir -p "$dir/questions"
+cd "$dir"
+
+# --- helper ---
+fetch() { curl -sL -A "$UA" "$1"; }
+
+# --- phase 1: download profile pages ---
+echo ""
+echo "[1/6] Downloading profile pages..."
+base="https://stackexchange.com/users/$se_uid/$se_slug"
+fetch "$base" > index.html
+fetch "${base}?tab=accounts" > accounts.html
+fetch "${base}?tab=reputation" > reputation.html
+fetch "${base}?tab=activity" > activity.html
+fetch "${base}?tab=subscriptions" > subscriptions.html
+echo "      5 profile pages saved"
+
+# --- phase 2: detect and download question pagination ---
+echo ""
+echo "[2/6] Checking question pagination..."
+q_pages=1
+p=2
+while true; do
+    count=$(fetch "https://stackexchange.com/users/top-questions/$se_uid/?page=$p" \
+        | grep -c 'top-question-container' || true)
+    [ "$count" -eq 0 ] && break
+    fetch "https://stackexchange.com/users/top-questions/$se_uid/?page=$p" > "tmp_qpage${p}.html"
+    echo "      Page $p: $count questions"
+    q_pages=$p
+    p=$((p + 1))
+done
+echo "      $q_pages question page(s) total"
+
+# --- phase 3: detect and download activity pagination ---
+echo ""
+echo "[3/6] Checking activity pagination..."
+a_pages=1
+p=2
+while true; do
+    count=$(fetch "https://stackexchange.com/users/activity/$se_uid?page=$p&filter=all" \
+        | grep -c 'event-row' || true)
+    [ "$count" -eq 0 ] && break
+    fetch "https://stackexchange.com/users/activity/$se_uid?page=$p&filter=all" > "tmp_activity${p}.html"
+    echo "      Page $p: $count rows"
+    a_pages=$p
+    p=$((p + 1))
+done
+echo "      $a_pages activity page(s) total"
+
+# --- phase 4: detect and download answer pagination ---
+echo ""
+echo "[4/6] Checking answer pagination..."
+ans_pages=1
+p=2
+while true; do
+    count=$(fetch "https://stackexchange.com/users/top-answers/$se_uid/?page=$p" \
+        | grep -c 'top-answer-container' || true)
+    [ "$count" -eq 0 ] && break
+    fetch "https://stackexchange.com/users/top-answers/$se_uid/?page=$p" > "tmp_anspage${p}.html"
+    echo "      Page $p: $count answers"
+    ans_pages=$p
+    p=$((p + 1))
+done
+echo "      $ans_pages answer page(s) total"
+
+# --- phase 5: discover and download all question pages ---
+echo ""
+echo "[5/6] Downloading question pages..."
+
+# collect all question URLs from every downloaded page
+# matches any SE site, MathOverflow, StackOverflow, superuser, serverfault, askubuntu
+all_urls=$(
+    cat index.html accounts.html activity.html tmp_qpage*.html tmp_anspage*.html tmp_activity*.html 2>/dev/null \
+    | grep -oP 'href="https://([a-z]+\.stackexchange\.com|mathoverflow\.net|stackoverflow\.com|superuser\.com|serverfault\.com|askubuntu\.com)/questions/\d+[^"]*"' \
+    | grep -oP 'https://[^"]+' \
+    | sed 's|/[^/]*#.*||; s|/$||' \
+    | sort -u
+)
+
+# download each question page
+n_questions=0
+for qurl in $all_urls; do
+    # parse site and question id
+    site=$(echo "$qurl" | grep -oP 'https://\K[^/]+')
+    qid=$(echo "$qurl" | grep -oP '/questions/\K\d+')
+    [ -z "$qid" ] && continue
+
+    # determine prefix
+    case "$site" in
+        math.stackexchange.com)        prefix="math" ;;
+        mathoverflow.net)              prefix="mo" ;;
+        stackoverflow.com)             prefix="so" ;;
+        superuser.com)                 prefix="su" ;;
+        serverfault.com)               prefix="sf" ;;
+        askubuntu.com)                 prefix="au" ;;
+        *.stackexchange.com)           prefix=$(echo "$site" | sed 's/\.stackexchange\.com//') ;;
+        *)                             prefix=$(echo "$site" | sed 's/\..*//')  ;;
+    esac
+
+    fname="questions/${prefix}-${qid}.html"
+    if [ -f "$fname" ]; then
+        continue
+    fi
+
+    fetch "$qurl" > "$fname"
+    size=$(wc -c < "$fname")
+    if [ "$size" -lt 5000 ]; then
+        echo "      WARN: $fname is only ${size}B (may be blocked)"
+    fi
+    n_questions=$((n_questions + 1))
+    printf '      %s\r' "$fname"
+done
+echo "      $n_questions question pages downloaded"
+
+# --- phase 6: generate and run stitch script ---
+echo ""
+echo "[6/6] Stitching..."
+
+# build site->ids mapping by scanning downloaded files
+math_ids=""
+mo_ids=""
+so_ids=""
+other_sites=""
+for f in questions/*.html; do
+    bn=$(basename "$f" .html)
+    prefix=$(echo "$bn" | sed 's/-[0-9]*//')
+    qid=$(echo "$bn" | grep -oP '\d+$')
+    case "$prefix" in
+        math)  math_ids="$math_ids $qid" ;;
+        mo)    mo_ids="$mo_ids $qid" ;;
+        so)    so_ids="$so_ids $qid" ;;
+        *)     other_sites="$other_sites $prefix:$qid" ;;
+    esac
+done
+
+# generate stitch.py
+cat > stitch.py << 'STITCH_HEADER'
+#!/usr/bin/env python3
+"""Auto-generated stitcher for SE profile archive."""
+import re, os, sys, json
+
+# === Config (injected by se-archive) ===
+STITCH_HEADER
+
+# inject config
+cat >> stitch.py << STITCH_CONFIG
+SE_UID = "$se_uid"
+SE_SLUG = "$se_slug"
+Q_PAGES = $q_pages
+A_PAGES = $a_pages
+ANS_PAGES = $ans_pages
+STITCH_CONFIG
+
+cat >> stitch.py << 'STITCH_BODY'
+
+PROFILE_FILES = ['index.html', 'accounts.html', 'reputation.html', 'activity.html', 'subscriptions.html']
+
+TAB_REWRITES = {
+    f'/users/{SE_UID}/{SE_SLUG}?tab=top': 'index.html',
+    f'/users/{SE_UID}/{SE_SLUG}?tab=accounts': 'accounts.html',
+    f'/users/{SE_UID}/{SE_SLUG}?tab=reputation': 'reputation.html',
+    f'/users/{SE_UID}/{SE_SLUG}?tab=activity': 'activity.html',
+    f'/users/{SE_UID}/{SE_SLUG}?tab=subscriptions': 'subscriptions.html',
+    f'/users/{SE_UID}/{SE_SLUG}': 'index.html',
+}
+
+# Build question ID -> local file map by scanning questions/ directory
+QUESTION_MAP = {}  # (site_domain, qid) -> local_path
+SITE_PATTERNS = {
+    'math': r'math\.stackexchange\.com',
+    'mo': r'mathoverflow\.net',
+    'so': r'stackoverflow\.com',
+    'su': r'superuser\.com',
+    'sf': r'serverfault\.com',
+    'au': r'askubuntu\.com',
+}
+for fname in os.listdir('questions'):
+    if not fname.endswith('.html'):
+        continue
+    parts = fname[:-5].rsplit('-', 1)
+    if len(parts) != 2:
+        continue
+    prefix, qid = parts
+    if prefix not in SITE_PATTERNS:
+        # generic stackexchange site
+        SITE_PATTERNS[prefix] = rf'{re.escape(prefix)}\.stackexchange\.com'
+    QUESTION_MAP[(prefix, qid)] = f'questions/{fname}'
+
+def is_internal(href):
+    return (href.startswith('#') or
+            href.startswith('questions/') or
+            href in set(PROFILE_FILES))
+
+def rewrite_tabs(html):
+    for old, new in TAB_REWRITES.items():
+        html = html.replace(f'href="{old}"', f'href="{new}"')
+        html = html.replace(f'href="{old.replace("&","&amp;")}"', f'href="{new}"')
+    return html
+
+def rewrite_questions(html):
+    for (prefix, qid), local_path in QUESTION_MAP.items():
+        pattern_str = SITE_PATTERNS.get(prefix, '')
+        if not pattern_str:
+            continue
+        html = re.sub(
+            rf'href="https://{pattern_str}/questions/{qid}(/[^"]*|)"',
+            f'href="{local_path}"', html)
+        # also catch /a/ID answer share links and rewrite to local anchor
+        html = re.sub(
+            rf'href="https://{pattern_str}/a/{qid}(/[^"]*|)"',
+            f'href="{local_path}"', html)
+    return html
+
+def kill_external_links(html):
+    def replace_tag(m):
+        full_tag = m.group(0)
+        inner = m.group(1)
+        href_m = re.search(r'href="([^"]*)"', full_tag.split('>')[0])
+        if not href_m:
+            return full_tag
+        href = href_m.group(1)
+        if is_internal(href):
+            return full_tag
+        opening = full_tag.split('>')[0] + '>'
+        class_m = re.search(r'class="([^"]*)"', opening)
+        cls = f' class="{class_m.group(1)}"' if class_m else ''
+        return f'<span{cls}>{inner}</span>'
+    html = re.sub(r'<a\b[^>]*>([^<]*(?:<(?!/a>)[^<]*)*)</a>', replace_tag, html)
+    return html
+
+def inline_pagination(html, container_id, pager_id, page_prefix, show_fn, tmp_pattern, max_page):
+    pages = {}
+    for p in range(2, max_page + 1):
+        path = tmp_pattern.format(p)
+        if os.path.exists(path):
+            with open(path) as f:
+                pages[p] = f.read()
+    if not pages:
+        return html
+
+    def extract_items(fragment):
+        m = re.search(rf'<div id="{container_id}">(.*?)<div id="{pager_id}"', fragment, re.DOTALL)
+        return m.group(1) if m else ''
+
+    container_start = html.find(f'<div id="{container_id}">')
+    if container_start == -1:
+        return html
+    pager_start = html.find(f'<div id="{pager_id}"', container_start)
+    if pager_start == -1:
+        # no pager — just append pages
+        container_end = html.find('</div>', container_start + len(f'<div id="{container_id}">'))
+        p1_start = container_start + len(f'<div id="{container_id}">')
+        p1_content = html[p1_start:container_end]
+        page_divs = f'<div class="{page_prefix}-page" id="{page_prefix}-page-1">{p1_content}</div>\n'
+        for p in sorted(pages.keys()):
+            content = extract_items(pages[p])
+            if not content:
+                # try without pager
+                m = re.search(rf'<div id="{container_id}">(.*?)</div>\s*</div>', pages[p], re.DOTALL)
+                content = m.group(1) if m else ''
+            page_divs += f'<div class="{page_prefix}-page" id="{page_prefix}-page-{p}" style="display:none;">{content}</div>\n'
+        total = max(pages.keys())
+        btns = ''
+        for p in range(1, total + 1):
+            cls = 'page-numbers current' if p == 1 else 'page-numbers'
+            style = '' if p == 1 else ' style="cursor:pointer"'
+            btns += f'<span class="{cls}" data-{page_prefix}page="{p}" onclick="{show_fn}({p})"{style}>{p}</span>\n'
+        new_block = f'''<div id="{container_id}">
+{page_divs}
+<div id="{pager_id}" class="pager float-right">
+{btns}
+</div>
+</div>
+<script>
+function {show_fn}(n) {{
+    document.querySelectorAll('.{page_prefix}-page').forEach(function(el) {{ el.style.display = 'none'; }});
+    document.getElementById('{page_prefix}-page-' + n).style.display = '';
+    document.querySelectorAll('#{pager_id} [data-{page_prefix}page]').forEach(function(el) {{
+        el.className = parseInt(el.dataset.{page_prefix}page) === n ? 'page-numbers current' : 'page-numbers';
+        el.style.cursor = parseInt(el.dataset.{page_prefix}page) === n ? '' : 'pointer';
+    }});
+}}
+</script>'''
+        html = html[:container_start] + new_block + html[container_end + len('</div>'):]
+        return html
+
+    pager_end_tag = html.find('</div>', pager_start)
+    p1_start = container_start + len(f'<div id="{container_id}">')
+    p1_content = html[p1_start:pager_start]
+
+    page_divs = f'<div class="{page_prefix}-page" id="{page_prefix}-page-1">{p1_content}</div>\n'
+    for p in sorted(pages.keys()):
+        content = extract_items(pages[p])
+        page_divs += f'<div class="{page_prefix}-page" id="{page_prefix}-page-{p}" style="display:none;">{content}</div>\n'
+
+    total = max(pages.keys())
+    btns = ''
+    for p in range(1, total + 1):
+        cls = 'page-numbers current' if p == 1 else 'page-numbers'
+        style = '' if p == 1 else ' style="cursor:pointer"'
+        btns += f'<span class="{cls}" data-{page_prefix}page="{p}" onclick="{show_fn}({p})"{style}>{p}</span>\n'
+
+    new_block = f'''<div id="{container_id}">
+{page_divs}
+<div id="{pager_id}" class="pager float-right">
+{btns}
+</div>
+</div>
+<script>
+function {show_fn}(n) {{
+    document.querySelectorAll('.{page_prefix}-page').forEach(function(el) {{ el.style.display = 'none'; }});
+    document.getElementById('{page_prefix}-page-' + n).style.display = '';
+    document.querySelectorAll('#{pager_id} [data-{page_prefix}page]').forEach(function(el) {{
+        el.className = parseInt(el.dataset.{page_prefix}page) === n ? 'page-numbers current' : 'page-numbers';
+        el.style.cursor = parseInt(el.dataset.{page_prefix}page) === n ? '' : 'pointer';
+    }});
+}}
+</script>'''
+
+    html = html[:container_start] + new_block + html[pager_end_tag + len('</div>'):]
+    return html
+
+
+def inline_answer_pagination(html, max_page):
+    pages = {}
+    for p in range(2, max_page + 1):
+        path = f'tmp_anspage{p}.html'
+        if os.path.exists(path):
+            with open(path) as f:
+                pages[p] = f.read()
+    if not pages:
+        # still kill the pager JS
+        html = re.sub(r'\$\(document\)\.on\("click",\s*"#answer-pager a".*?\}\);', '', html, flags=re.DOTALL)
+        return html
+
+    def extract_items(fragment):
+        m = re.search(r'<div id="top-answers-container">(.*?)(?:<div id="answer-pager"|</div>\s*$)', fragment, re.DOTALL)
+        return m.group(1) if m else ''
+
+    container_start = html.find('<div id="top-answers-container">')
+    if container_start == -1:
+        return html
+
+    pager_start = html.find('<div id="answer-pager"', container_start)
+    if pager_start == -1:
+        # no pager div, find end of container
+        # just append after current content
+        end_tag = html.find('</div>', container_start + 30)
+        p1_start = container_start + len('<div id="top-answers-container">')
+        p1_content = html[p1_start:end_tag]
+    else:
+        p1_start = container_start + len('<div id="top-answers-container">')
+        p1_content = html[p1_start:pager_start]
+
+    page_divs = f'<div class="ans-page" id="ans-page-1">{p1_content}</div>\n'
+    for p in sorted(pages.keys()):
+        content = extract_items(pages[p])
+        page_divs += f'<div class="ans-page" id="ans-page-{p}" style="display:none;">{content}</div>\n'
+
+    total = max(pages.keys())
+    btns = ''
+    for p in range(1, total + 1):
+        cls = 'page-numbers current' if p == 1 else 'page-numbers'
+        style = '' if p == 1 else ' style="cursor:pointer"'
+        btns += f'<span class="{cls}" data-anspage="{p}" onclick="showAnsPage({p})"{style}>{p}</span>\n'
+
+    new_block = f'''<div id="top-answers-container">
+{page_divs}
+<div id="answer-pager" class="pager float-right">
+{btns}
+</div>
+</div>
+<script>
+function showAnsPage(n) {{
+    document.querySelectorAll('.ans-page').forEach(function(el) {{ el.style.display = 'none'; }});
+    document.getElementById('ans-page-' + n).style.display = '';
+    document.querySelectorAll('#answer-pager [data-anspage]').forEach(function(el) {{
+        el.className = parseInt(el.dataset.anspage) === n ? 'page-numbers current' : 'page-numbers';
+        el.style.cursor = parseInt(el.dataset.anspage) === n ? '' : 'pointer';
+    }});
+}}
+</script>'''
+
+    if pager_start != -1:
+        pager_end_tag = html.find('</div>', pager_start)
+        html = html[:container_start] + new_block + html[pager_end_tag + len('</div>'):]
+    else:
+        end_tag = html.find('</div>', container_start + 30)
+        html = html[:container_start] + new_block + html[end_tag + len('</div>'):]
+
+    # kill old AJAX
+    html = re.sub(r'\$\(document\)\.on\("click",\s*"#answer-pager a".*?\}\);', '', html, flags=re.DOTALL)
+    return html
+
+
+# ============================================================
+# MAIN
+# ============================================================
+for fname in PROFILE_FILES:
+    if not os.path.exists(fname):
+        continue
+    print(f"\nProcessing {fname}...")
+    with open(fname, 'r') as f:
+        html = f.read()
+
+    html = rewrite_tabs(html)
+    print(f"  [1] Tabs rewritten")
+
+    if fname == 'index.html':
+        # inline pagination BEFORE rewriting links so inlined content gets rewritten
+        if Q_PAGES > 1:
+            html = inline_pagination(html,
+                'top-questions-container', 'question-pager',
+                'q', 'showQPage', 'tmp_qpage{}.html', Q_PAGES)
+            print(f"  [2] Questions pagination inlined ({Q_PAGES} pages)")
+        if ANS_PAGES > 1:
+            html = inline_answer_pagination(html, ANS_PAGES)
+            print(f"  [2] Answers pagination inlined ({ANS_PAGES} pages)")
+        else:
+            html = re.sub(r'\$\(document\)\.on\("click",\s*"#answer-pager a".*?\}\);', '', html, flags=re.DOTALL)
+    elif fname == 'activity.html':
+        if A_PAGES > 1:
+            html = inline_pagination(html,
+                'activity-container', 'activity-pager',
+                'a', 'showAPage', 'tmp_activity{}.html', A_PAGES)
+            print(f"  [2] Activity pagination inlined ({A_PAGES} pages)")
+            html = re.sub(r'\$\(document\)\.on\("click",\s*"#activity-tabs a.*?\}\);', '', html, flags=re.DOTALL)
+
+    # rewrite question links AFTER inlining so paginated content is included
+    html = rewrite_questions(html)
+    print(f"  [3] Question links localized")
+
+    html = kill_external_links(html)
+
+    live_a = re.findall(r'<a\b[^>]*href="([^"]*)"', html)
+    internal = [h for h in live_a if is_internal(h)]
+    external = [h for h in live_a if not is_internal(h)]
+    print(f"  [4] Links: {len(internal)} internal, {len(external)} external remaining")
+    if external:
+        for e in sorted(set(external))[:5]:
+            print(f"      MISSED: {e}")
+
+    with open(fname, 'w') as f:
+        f.write(html)
+
+# cleanup temp files
+import glob
+for pattern in ['tmp_qpage*.html', 'tmp_activity*.html', 'tmp_anspage*.html']:
+    for f in glob.glob(pattern):
+        os.remove(f)
+
+print("\nDone!")
+STITCH_BODY
+
+python3 stitch.py
+
+echo ""
+echo "=== Archive complete ==="
+echo "    Location: $dir"
+echo "    Serve with: cd $dir && python3 -m http.server 8000"
